@@ -27,6 +27,118 @@ def extract_function_name(prompt: str) -> str:
     return match.group(1) if match else ""
 
 
+def extract_return_type(signature: str) -> str:
+    """
+    Extract the return type from a Ballerina function signature.
+    e.g. "function foo(int x) returns int {" → "int"
+         "function bar(string s) returns string[] {" → "string[]"
+         "function baz(int x) returns [int?, int?] {" → "[int?, int?]"
+         "function qux(int x) returns boolean {" → "boolean"
+    Returns empty string if no return type found.
+    """
+    match = re.search(r"returns\s+(.+?)\s*\{", signature)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def make_compilable_stub(
+    imports: list[str],
+    signature: str,
+    body_lines: list[str],
+    return_type: str,
+) -> str:
+    """
+    Wrap a partial function body with a type-appropriate stub return
+    statement and closing brace, so it can be compile-checked even
+    though the body is incomplete.
+
+    For example, if the return type is 'int', appends:
+        return 0;
+    }
+    """
+    stub_return = _stub_return_for_type(return_type)
+    parts = list(imports)
+    if imports:
+        parts.append("")
+    parts.append(signature)
+    parts.extend(body_lines)
+    if stub_return:
+        parts.append(f"    {stub_return}")
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _stub_return_for_type(return_type: str) -> str:
+    """
+    Generate a dummy return statement for a given Ballerina return type.
+    This allows partial functions to compile for validation.
+    """
+    rt = return_type.strip()
+    if not rt:
+        return "return;"
+
+    # Nullable types (e.g. "string?")
+    if rt.endswith("?"):
+        return "return ();"
+
+    # Tuple types (e.g. "[int?, int?]")
+    if rt.startswith("[") and rt.endswith("]"):
+        inner = rt[1:-1]
+        parts = _split_tuple_types(inner)
+        stubs = [_stub_value_for_type(p.strip()) for p in parts]
+        return f"return [{', '.join(stubs)}];"
+
+    # Array types (e.g. "int[]", "string[]")
+    if rt.endswith("[]"):
+        return "return [];"
+
+    # Simple types
+    return f"return {_stub_value_for_type(rt)};"
+
+
+def _stub_value_for_type(t: str) -> str:
+    """Return a default value expression for a Ballerina type."""
+    t = t.strip()
+    if t.endswith("?"):
+        return "()"
+    if t == "int":
+        return "0"
+    if t == "float" or t == "decimal":
+        return "0.0"
+    if t == "boolean":
+        return "false"
+    if t == "string":
+        return '""'
+    if t.endswith("[]"):
+        return "[]"
+    # Fallback
+    return "0"
+
+
+def _split_tuple_types(inner: str) -> list[str]:
+    """
+    Split comma-separated types inside a tuple, respecting nested brackets.
+    e.g. "int?, int?" → ["int?", "int?"]
+    """
+    parts = []
+    depth = 0
+    current = ""
+    for ch in inner:
+        if ch in ("[", "("):
+            depth += 1
+        elif ch in ("]", ")"):
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        parts.append(current)
+    return parts
+
+
 def is_function_complete(code: str) -> bool:
     """
     Check if the generated code has balanced braces, meaning

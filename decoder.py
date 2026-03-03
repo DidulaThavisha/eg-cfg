@@ -1,25 +1,20 @@
 """
 Execution-Guided Constrained Function Generation (EG-CFG) Decoder
 
-This decoder generates Ballerina code **line-by-line**, running each
-candidate through the Ballerina compiler in a sandbox.  Lines that cause
-compile errors are discarded and the model is forced to try alternative
-continuations.
+Revised strategy — "Generate-then-Validate-then-Repair":
 
-Strategy
---------
-1. Feed the model the prompt and generate `BEAM_WIDTH` candidate next-lines
-   using sampling with temperature.
-2. For each candidate, append it to the code-so-far and run `bal build`
-   in the sandbox.
-3. Keep only candidates that compile.  Rank them by model log-probability.
-4. Pick the best candidate, commit it, and repeat.
-5. When the function is complete (braces balanced), run `bal test` against
-   the provided unit tests.
-6. If tests fail, retry the entire generation (up to MAX_FULL_RETRIES).
+Phase 1 — Full Generation (fast path):
+  Generate the entire function at once with multiple candidates.
+  If any candidate compiles AND passes tests → done.
+
+Phase 2 — Chunked Line-by-Line with Stub Validation:
+  Generate the function body in chunks of lines.  After each chunk,
+  compile-check by wrapping the partial body with a type-appropriate
+  stub return + '}'.  Discard chunks that introduce new errors.
+
+Phase 3 — Retry with different seeds.
 """
 
-import copy
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -33,9 +28,11 @@ from utils import (
     build_partial_code,
     count_tests,
     extract_function_signature,
+    extract_return_type,
     is_function_complete,
     strip_markdown_fences,
     extract_function_block,
+    make_compilable_stub,
 )
 
 logger = logging.getLogger("eg_cfg.decoder")
@@ -61,17 +58,12 @@ class DecodingResult:
     test_details: dict = field(default_factory=dict)
     attempts: int = 0
     error_messages: list[str] = field(default_factory=list)
+    compile_checks: int = 0
 
 
 class EGCFGDecoder:
     """
-    Execution-Guided line-by-line decoder.
-
-    Parameters
-    ----------
-    model : The language model (from Unsloth FastLanguageModel)
-    tokenizer : The tokenizer
-    sandbox : BallerinaSandbox instance for compile/test checks
+    Execution-Guided decoder with multiple strategies.
     """
 
     def __init__(self, model, tokenizer: PreTrainedTokenizerBase, sandbox: BallerinaSandbox):
@@ -79,242 +71,109 @@ class EGCFGDecoder:
         self.tokenizer = tokenizer
         self.sandbox = sandbox
         self.device = next(model.parameters()).device
+        self.compile_checks = 0
 
     # ─── Public API ─────────────────────────────────────────────────
 
     def generate(self, problem_id: str, prompt: str, test_code: str) -> DecodingResult:
         """
-        Main entry point.  Tries EG-CFG line-by-line decoding first,
-        and falls back to full-generation-then-filter if EG-CFG cannot
-        produce a compilable solution.
+        Main entry point.  Tries strategies in order:
+        1. Full generation with multiple candidates (fastest)
+        2. Chunked line-by-line EG-CFG (most robust)
         """
         logger.info("═══ Generating solution for %s ═══", problem_id)
+        self.compile_checks = 0
+        best_code = ""
+        best_compile_passed = False
 
         for attempt in range(1, config.MAX_FULL_RETRIES + 1):
             logger.info("Attempt %d/%d for %s", attempt, config.MAX_FULL_RETRIES, problem_id)
 
-            # --- Strategy 1: Line-by-line EG-CFG ---
-            code = self._line_by_line_decode(prompt, attempt)
-            if code:
-                compile_res = self.sandbox.compile_check(code)
-                if compile_res.success:
-                    logger.info("Compile passed for %s (line-by-line)", problem_id)
+            # --- Strategy 1: Full generation (try multiple candidates) ---
+            candidates = self._generate_full_candidates(prompt, seed_offset=attempt)
+            for i, code in enumerate(candidates):
+                if not code:
+                    continue
+                res = self._compile_check(code)
+                if res.success:
+                    best_code = code
+                    best_compile_passed = True
+                    logger.info("Full-gen candidate %d compiled ✓", i)
                     test_res = self.sandbox.test_check(code, test_code)
                     test_counts = count_tests(test_res.output)
                     if test_res.success:
-                        logger.info("✅ All tests passed for %s!", problem_id)
+                        logger.info("✅ All tests passed for %s (full-gen, attempt %d)!", problem_id, attempt)
                         return DecodingResult(
-                            problem_id=problem_id,
-                            success=True,
-                            code=code,
-                            compile_passed=True,
-                            tests_passed=True,
-                            test_details=test_counts,
-                            attempts=attempt,
+                            problem_id=problem_id, success=True, code=code,
+                            compile_passed=True, tests_passed=True,
+                            test_details=test_counts, attempts=attempt,
+                            compile_checks=self.compile_checks,
                         )
                     else:
-                        logger.warning(
-                            "Tests failed for %s: %s — retrying",
-                            problem_id, test_counts,
+                        logger.info(
+                            "Full-gen candidate %d: compile ✓ tests ✗ %s",
+                            i, test_counts,
                         )
+                else:
+                    logger.debug("Full-gen candidate %d: compile ✗ %s", i, res.errors[:2])
+                    if not best_code:
+                        best_code = code
 
-            # --- Strategy 2: Full generation + extract + test ---
-            code = self._full_generation_decode(prompt, attempt)
+            # --- Strategy 2: Chunked line-by-line EG-CFG ---
+            code = self._chunked_line_by_line_decode(prompt, seed_offset=attempt)
             if code:
-                compile_res = self.sandbox.compile_check(code)
-                if compile_res.success:
-                    logger.info("Compile passed for %s (full-gen)", problem_id)
+                best_code = code
+                res = self._compile_check(code)
+                if res.success:
+                    best_compile_passed = True
+                    logger.info("Chunked EG-CFG compiled ✓ for %s", problem_id)
                     test_res = self.sandbox.test_check(code, test_code)
                     test_counts = count_tests(test_res.output)
                     if test_res.success:
-                        logger.info("✅ All tests passed for %s!", problem_id)
+                        logger.info("✅ All tests passed for %s (chunked EG-CFG)!", problem_id)
                         return DecodingResult(
-                            problem_id=problem_id,
-                            success=True,
-                            code=code,
-                            compile_passed=True,
-                            tests_passed=True,
-                            test_details=test_counts,
-                            attempts=attempt,
+                            problem_id=problem_id, success=True, code=code,
+                            compile_passed=True, tests_passed=True,
+                            test_details=test_counts, attempts=attempt,
+                            compile_checks=self.compile_checks,
                         )
                     else:
-                        logger.warning(
-                            "Tests failed for %s (full-gen): %s",
-                            problem_id, test_counts,
-                        )
+                        logger.info("Chunked EG-CFG: compile ✓ tests ✗ %s", test_counts)
 
             self.sandbox.reset()
 
-        # All retries exhausted — return the last code we had
+        # Exhausted all retries
         return DecodingResult(
-            problem_id=problem_id,
-            success=False,
-            code=code if code else "",
-            compile_passed=False,
-            tests_passed=False,
+            problem_id=problem_id, success=False, code=best_code,
+            compile_passed=best_compile_passed, tests_passed=False,
             attempts=config.MAX_FULL_RETRIES,
             error_messages=["Exhausted all retries"],
+            compile_checks=self.compile_checks,
         )
 
-    # ─── Strategy 1: Line-by-line EG-CFG ───────────────────────────
+    # ─── Compile check wrapper (with counting) ─────────────────────
 
-    def _line_by_line_decode(self, prompt: str, seed_offset: int = 0) -> Optional[str]:
+    def _compile_check(self, code: str) -> SandboxResult:
+        """Compile-check with counter for profiling."""
+        self.compile_checks += 1
+        return self.sandbox.compile_check(code)
+
+    # ─── Strategy 1: Full generation ───────────────────────────────
+
+    def _generate_full_candidates(self, prompt: str, seed_offset: int = 0) -> list[str]:
         """
-        Generate code line-by-line.  After each line, compile-check
-        the partial code.  Discard lines that break compilation.
+        Generate the entire function at once, multiple times with
+        different temperatures.  Return list of extracted code strings.
         """
-        signature = extract_function_signature(prompt)
-        if not signature:
-            logger.error("Could not extract function signature from prompt")
-            return None
+        model_input = self._build_model_input(prompt)
+        input_ids = self._tokenize(model_input)
 
-        # Detect any imports the prompt implies
-        imports = self._detect_imports(prompt)
-
-        body_lines: list[str] = []
-        total_tokens_generated = 0
-
-        # Build the model input: the full prompt up to where the body starts
-        model_prompt = config.PROMPT_TEMPLATE.format(prompt=prompt)
-
-        for line_idx in range(config.MAX_TOTAL_LINES):
-            if total_tokens_generated >= config.MAX_NEW_TOKENS_TOTAL:
-                logger.warning("Token budget exhausted at line %d", line_idx)
-                break
-
-            candidates = self._generate_candidate_lines(
-                model_prompt, body_lines, signature, imports,
-                num_candidates=config.BEAM_WIDTH,
-                seed_offset=seed_offset + line_idx,
-            )
-
-            found_valid = False
-            for cand_line, cand_tokens in candidates:
-                # Check if this line closes the function
-                test_lines = body_lines + [cand_line]
-                test_code = build_partial_code(imports, signature, test_lines)
-
-                # If braces are balanced, function is complete
-                if is_function_complete(test_code):
-                    test_code_with_close = test_code
-                else:
-                    # Append a closing brace to make it compilable
-                    test_code_with_close = test_code + "\n}"
-
-                result = self.sandbox.compile_check(test_code_with_close)
-                if result.success:
-                    body_lines.append(cand_line)
-                    total_tokens_generated += cand_tokens
-                    found_valid = True
-                    logger.debug("  Line %d accepted: %s", line_idx, cand_line.strip())
-                    break
-                else:
-                    logger.debug(
-                        "  Line %d rejected: %s → %s",
-                        line_idx, cand_line.strip(), result.errors[:2],
-                    )
-
-            if not found_valid:
-                logger.warning("No valid candidate found at line %d, aborting line-by-line", line_idx)
-                return None
-
-            # Check if function is complete
-            full_code = build_partial_code(imports, signature, body_lines)
-            if is_function_complete(full_code):
-                logger.info("Function complete at line %d", line_idx)
-                return full_code
-
-        # Ran out of lines — try to close
-        full_code = build_partial_code(imports, signature, body_lines, close=True)
-        result = self.sandbox.compile_check(full_code)
-        if result.success:
-            return full_code
-        return None
-
-    def _generate_candidate_lines(
-        self,
-        model_prompt: str,
-        existing_body: list[str],
-        signature: str,
-        imports: list[str],
-        num_candidates: int,
-        seed_offset: int,
-    ) -> list[tuple[str, int]]:
-        """
-        Generate multiple candidate next-lines from the model.
-
-        Returns a list of (line_text, num_tokens) tuples sorted by
-        descending log-probability.
-        """
-        # Build the context: prompt + code so far
-        code_so_far_lines = []
-        for imp in imports:
-            code_so_far_lines.append(imp)
-        if imports:
-            code_so_far_lines.append("")
-        code_so_far_lines.append(signature)
-        code_so_far_lines.extend(existing_body)
-
-        full_input = model_prompt + "\n".join(code_so_far_lines) + "\n"
-
-        input_ids = self.tokenizer(
-            full_input, return_tensors="pt", truncation=True,
-            max_length=config.MAX_SEQ_LENGTH,
-        ).input_ids.to(self.device)
+        logger.debug("Model input (first 300 chars): %s", model_input[:300])
 
         candidates = []
-        seen = set()
 
-        for i in range(num_candidates):
-            torch.manual_seed(42 + seed_offset * 100 + i)
-
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    input_ids=input_ids,
-                    max_new_tokens=config.MAX_NEW_TOKENS_PER_LINE,
-                    do_sample=True,
-                    temperature=config.TEMPERATURE + (i * 0.05),  # slight diversity
-                    top_p=config.TOP_P,
-                    top_k=config.TOP_K,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-
-            new_tokens = outputs[0][input_ids.shape[1]:]
-            generated_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-
-            # Extract just the next line(s)
-            lines = generated_text.split("\n")
-            next_line = lines[0] if lines else ""
-
-            # Deduplicate
-            if next_line.strip() in seen:
-                continue
-            seen.add(next_line.strip())
-
-            num_tokens = len(self.tokenizer.encode(next_line))
-            candidates.append((next_line, num_tokens))
-
-        return candidates
-
-    # ─── Strategy 2: Full generation + extract ─────────────────────
-
-    def _full_generation_decode(self, prompt: str, seed_offset: int = 0) -> Optional[str]:
-        """
-        Generate the entire function at once, extract it, and validate.
-        This is the fallback when line-by-line fails.
-        """
-        model_prompt = config.PROMPT_TEMPLATE.format(prompt=prompt)
-
-        input_ids = self.tokenizer(
-            model_prompt, return_tensors="pt", truncation=True,
-            max_length=config.MAX_SEQ_LENGTH,
-        ).input_ids.to(self.device)
-
-        # Generate multiple full candidates
-        best_code = None
         for i in range(config.BEAM_WIDTH):
-            torch.manual_seed(123 + seed_offset * 100 + i)
+            torch.manual_seed(42 + seed_offset * 1000 + i * 7)
 
             with torch.no_grad():
                 outputs = self.model.generate(
@@ -326,45 +185,222 @@ class EGCFGDecoder:
                     top_k=config.TOP_K,
                     pad_token_id=self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
+                    attention_mask=torch.ones_like(input_ids),
+                )
+
+            new_tokens = outputs[0][input_ids.shape[1]:]
+            raw_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            logger.info("Full-gen raw output [%d] (%d chars):\n%.500s", i, len(raw_text), raw_text)
+
+            # Try to extract a clean function block
+            code = extract_function_block(raw_text)
+            if not code:
+                code = strip_markdown_fences(raw_text)
+            if code:
+                candidates.append(code)
+            else:
+                logger.debug("Full-gen candidate %d: could not extract code", i)
+
+        logger.info("Generated %d full candidates", len(candidates))
+        return candidates
+
+    # ─── Strategy 2: Chunked line-by-line EG-CFG ──────────────────
+
+    def _chunked_line_by_line_decode(
+        self, prompt: str, seed_offset: int = 0,
+        chunk_size: int = 3,
+    ) -> Optional[str]:
+        """
+        Generate code in chunks of `chunk_size` lines.  After each chunk,
+        wrap the partial body into a compilable stub and compile-check.
+        Reject chunks that introduce new compile errors.
+
+        This is much more practical than pure single-line because:
+        - A chunk of 3 lines is more likely to form a complete statement
+        - We use a type-appropriate stub return so partial functions compile
+        - Far fewer compile checks (~10-15 instead of 40+)
+        """
+        signature = extract_function_signature(prompt)
+        if not signature:
+            logger.error("Could not extract function signature from prompt")
+            return None
+
+        return_type = extract_return_type(signature)
+        imports = self._detect_imports(prompt)
+        body_lines: list[str] = []
+
+        model_input_base = self._build_model_input(prompt)
+
+        for chunk_idx in range(config.MAX_TOTAL_LINES // chunk_size + 1):
+            # Generate candidate chunks
+            candidates = self._generate_candidate_chunks(
+                model_input_base, body_lines, signature, imports,
+                chunk_size=chunk_size,
+                num_candidates=config.BEAM_WIDTH,
+                seed_offset=seed_offset * 100 + chunk_idx,
+            )
+
+            if not candidates:
+                logger.warning("No candidates generated at chunk %d", chunk_idx)
+                break
+
+            found_valid = False
+            for cand_lines, cand_tokens in candidates:
+                test_body = body_lines + cand_lines
+                test_code = build_partial_code(imports, signature, test_body)
+
+                # Check if the function is already complete (braces balanced)
+                if is_function_complete(test_code):
+                    result = self._compile_check(test_code)
+                    if result.success:
+                        logger.info("Chunk %d accepted (function complete, %d lines)",
+                                    chunk_idx, len(test_body))
+                        return test_code
+                    else:
+                        logger.debug("Chunk %d rejected (complete but errors): %s",
+                                     chunk_idx, result.errors[:2])
+                        continue
+
+                # Not complete yet — wrap with a stub return to make it compilable
+                stub_code = make_compilable_stub(imports, signature, test_body, return_type)
+                result = self._compile_check(stub_code)
+                if result.success:
+                    body_lines = test_body
+                    found_valid = True
+                    logger.debug("Chunk %d accepted (%d body lines so far)",
+                                 chunk_idx, len(body_lines))
+                    break
+                else:
+                    logger.debug("Chunk %d rejected: %s", chunk_idx, result.errors[:2])
+
+            if not found_valid:
+                logger.warning("No valid chunk at position %d, stopping chunked decode", chunk_idx)
+                break
+
+        # Try to close the function with a closing brace
+        if body_lines:
+            full_code = build_partial_code(imports, signature, body_lines, close=True)
+            if is_function_complete(full_code):
+                result = self._compile_check(full_code)
+                if result.success:
+                    return full_code
+
+        return None
+
+    def _generate_candidate_chunks(
+        self,
+        model_input_base: str,
+        existing_body: list[str],
+        signature: str,
+        imports: list[str],
+        chunk_size: int,
+        num_candidates: int,
+        seed_offset: int,
+    ) -> list[tuple[list[str], int]]:
+        """
+        Generate multiple candidate chunks (groups of lines) from the model.
+        Returns list of (lines, token_count) tuples.
+        """
+        # Build context: prompt + imports + signature + body so far
+        code_so_far_lines = list(imports)
+        if imports:
+            code_so_far_lines.append("")
+        code_so_far_lines.append(signature)
+        code_so_far_lines.extend(existing_body)
+
+        full_input = model_input_base + "\n".join(code_so_far_lines) + "\n"
+        input_ids = self._tokenize(full_input)
+
+        candidates = []
+        seen = set()
+
+        for i in range(num_candidates):
+            torch.manual_seed(42 + seed_offset * 13 + i * 7)
+
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    max_new_tokens=config.MAX_NEW_TOKENS_PER_LINE * chunk_size,
+                    do_sample=True,
+                    temperature=config.TEMPERATURE + (i * 0.05),
+                    top_p=config.TOP_P,
+                    top_k=config.TOP_K,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    attention_mask=torch.ones_like(input_ids),
                 )
 
             new_tokens = outputs[0][input_ids.shape[1]:]
             generated_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
-            # Try to extract a clean function block
-            code = extract_function_block(generated_text)
-            if not code:
-                code = strip_markdown_fences(generated_text)
+            # Extract the next `chunk_size` lines
+            all_lines = generated_text.split("\n")
+            chunk_lines = []
+            for line in all_lines:
+                chunk_lines.append(line)
+                if len(chunk_lines) >= chunk_size:
+                    break
+                # Stop early if we see a closing brace that would end the function
+                if line.strip() == "}":
+                    break
 
-            if not code:
+            if not chunk_lines:
                 continue
 
-            # Compile-check
-            result = self.sandbox.compile_check(code)
-            if result.success:
-                logger.info("Full-gen candidate %d compiled successfully", i)
-                return code
-            else:
-                logger.debug("Full-gen candidate %d failed: %s", i, result.errors[:3])
-                if best_code is None:
-                    best_code = code  # keep as fallback
+            # Deduplicate by normalized content
+            key = "\n".join(l.strip() for l in chunk_lines)
+            if key in seen:
+                continue
+            seen.add(key)
 
-        return best_code
+            num_tokens = len(self.tokenizer.encode("\n".join(chunk_lines)))
+            candidates.append((chunk_lines, num_tokens))
+
+        return candidates
 
     # ─── Helpers ───────────────────────────────────────────────────
 
+    def _build_model_input(self, prompt: str) -> str:
+        """Build the model input using the chat template or prompt template."""
+        # Try the tokenizer's chat template first (matches fine-tuning format)
+        if hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template:
+            messages = [
+                {"role": "user", "content": (
+                    "Complete the following Ballerina function. "
+                    "Only output the complete function implementation, no explanation.\n\n"
+                    f"{prompt}"
+                )},
+            ]
+            try:
+                formatted = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                logger.debug("Using chat template for model input")
+                return formatted
+            except Exception as e:
+                logger.warning("Chat template failed (%s), falling back to PROMPT_TEMPLATE", e)
+
+        # Fallback to config template
+        return config.PROMPT_TEMPLATE.format(prompt=prompt)
+
+    def _tokenize(self, text: str) -> torch.Tensor:
+        """Tokenize text and move to device."""
+        return self.tokenizer(
+            text, return_tensors="pt", truncation=True,
+            max_length=config.MAX_SEQ_LENGTH,
+        ).input_ids.to(self.device)
+
     @staticmethod
     def _detect_imports(prompt: str) -> list[str]:
-        """
-        Detect if the prompt requires any Ballerina imports.
-        """
+        """Detect if the prompt requires any Ballerina imports."""
         imports = []
         prompt_lower = prompt.lower()
 
-        # Common patterns that need imports
         if "md5" in prompt_lower or "hash" in prompt_lower:
             imports.append("import ballerina/crypto;")
-        if "ceiling" in prompt_lower or "ceil" in prompt_lower or "round" in prompt_lower:
+        if any(kw in prompt_lower for kw in ["ceiling", "ceil", "round"]):
             imports.append("import ballerina/lang.'float as floats;")
         if "math" in prompt_lower:
             imports.append("import ballerina/lang.'float as floats;")

@@ -159,6 +159,7 @@ def run_eg_cfg(
             "tests_passed": result.tests_passed,
             "test_details": result.test_details,
             "attempts": result.attempts,
+            "compile_checks": result.compile_checks,
             "elapsed_seconds": round(elapsed, 2),
             "code": result.code,
             "error_messages": result.error_messages,
@@ -167,8 +168,8 @@ def run_eg_cfg(
 
         status = "✅ PASS" if result.success else "❌ FAIL"
         logger.info(
-            "%s — %s — attempts=%d, time=%.1fs",
-            status, problem_id, result.attempts, elapsed,
+            "%s — %s — attempts=%d, compile_checks=%d, time=%.1fs",
+            status, problem_id, result.attempts, result.compile_checks, elapsed,
         )
 
         # Save intermediate results after each problem
