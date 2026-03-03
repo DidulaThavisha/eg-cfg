@@ -4,7 +4,7 @@ for Ballerina code generation.
 """
 
 # ─── Model Configuration ───────────────────────────────────────────────
-MODEL_NAME = "lora_model"  # Path to your fine-tuned LoRA model
+MODEL_NAME = "didula-wso2/exp_23_emb_grpo_checkpoint_220_16bit_vllm"  # Path to your fine-tuned LoRA model
 MAX_SEQ_LENGTH = 2048
 DTYPE = None  # None for auto-detection
 LOAD_IN_4BIT = True
