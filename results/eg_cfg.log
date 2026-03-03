@@ -1,0 +1,12 @@
+2026-03-03 10:57:50,704 [eg_cfg] INFO: Loaded 29 problems from problems.json
+2026-03-03 10:57:50,704 [eg_cfg] INFO: ═══ DRY RUN — testing sandbox infrastructure ═══
+2026-03-03 10:57:54,262 [eg_cfg] INFO: Compile check (valid code):   success=True
+2026-03-03 10:57:57,382 [eg_cfg] INFO: Compile check (syntax error): success=False
+2026-03-03 10:58:00,296 [eg_cfg] INFO: Test check (correct solution): success=True
+2026-03-03 10:58:00,298 [eg_cfg] INFO: ═══ DRY RUN COMPLETE — sandbox is working! ═══
+2026-03-03 10:59:18,037 [eg_cfg] INFO: Loaded 29 problems from problems.json
+2026-03-03 10:59:18,037 [eg_cfg] INFO: Running problems: [0, 4, 10]
+2026-03-03 10:59:18,037 [eg_cfg] INFO: Loading model from 'lora_model' ...
+2026-03-03 11:00:00,547 [eg_cfg] INFO: Loaded 29 problems from problems.json
+2026-03-03 11:00:00,548 [eg_cfg] INFO: Running problems: [0, 4, 10]
+2026-03-03 11:00:00,548 [eg_cfg] INFO: Loading model from 'lora_model' ...
