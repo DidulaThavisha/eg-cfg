@@ -24,7 +24,8 @@ import os
 import sys
 import time
 from datetime import datetime
-
+from unsloth import FastLanguageModel
+from transformers import TextStreamer
 import config
 from sandbox import BallerinaSandbox
 from decoder import EGCFGDecoder, DecodingResult
@@ -48,8 +49,7 @@ def load_model():
     """Load the fine-tuned model using Unsloth."""
     logger.info("Loading model from '%s' ...", config.MODEL_NAME)
 
-    from unsloth import FastLanguageModel
-    from transformers import TextStreamer
+
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config.MODEL_NAME,
