@@ -23,7 +23,13 @@ import logging
 import os
 import sys
 import time
+import warnings
 from datetime import datetime
+
+# Suppress noisy transformers deprecation warnings that break Python's logging
+warnings.filterwarnings("ignore", category=FutureWarning)
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
 from unsloth import FastLanguageModel
 from transformers import TextStreamer
 import config

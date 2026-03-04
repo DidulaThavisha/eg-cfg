@@ -16,11 +16,32 @@ Phase 3 — Retry with different seeds.
 """
 
 import logging
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
+# Suppress the transformers deprecation warning that breaks Python's logging
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*attention mask.*")
+
 import torch
 from transformers import PreTrainedTokenizerBase
+
+# Monkey-patch transformers logging to prevent the "%s" % FutureWarning crash
+import transformers.utils.logging as _tf_logging
+_orig_warning = _tf_logging.get_logger.__func__  # noqa
+try:
+    _tfl = _tf_logging.get_logger("transformers.modeling_attn_mask_utils")
+    _orig_warn = _tfl.warning
+    def _safe_warn(msg, *args, **kwargs):
+        try:
+            _orig_warn(msg, *args, **kwargs)
+        except (TypeError, ValueError):
+            pass  # Swallow broken format strings from transformers internals
+    _tfl.warning = _safe_warn
+    _tfl.warning_once = _safe_warn
+except Exception:
+    pass
 
 import config
 from sandbox import BallerinaSandbox, SandboxResult
