@@ -28,9 +28,8 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 # Monkey-patch transformers logging to prevent the "%s" % FutureWarning crash
-import transformers.utils.logging as _tf_logging
-_orig_warning = _tf_logging.get_logger.__func__  # noqa
 try:
+    import transformers.utils.logging as _tf_logging
     _tfl = _tf_logging.get_logger("transformers.modeling_attn_mask_utils")
     _orig_warn = _tfl.warning
     def _safe_warn(msg, *args, **kwargs):
@@ -41,7 +40,7 @@ try:
     _tfl.warning = _safe_warn
     _tfl.warning_once = _safe_warn
 except Exception:
-    pass
+    pass  # If anything goes wrong with patching, just skip it
 
 import config
 from sandbox import BallerinaSandbox, SandboxResult
